@@ -47,19 +47,24 @@ MAS_TO_ARCSEC = 1000.  # Conversion factor from milli-arcseconds to arcseconds
 # Module-level dictionary contains instrument/detector-specific parameters used later on in the script.
 detector_specific_params = {"acs": {"hrc": {"fwhmpsf": 0.152,  # 0.073
                                             "classify": True,
-                                            "threshold": None},
+                                            "threshold": None,
+                                            "saturation_limit": 70000.0},
                                     "sbc": {"fwhmpsf": 0.13,  # 0.065
                                             "classify": False,
-                                            "threshold": 2.0},
+                                            "threshold": 5.0,
+                                            "saturation_limit": -20},
                                     "wfc": {"fwhmpsf": 0.13,  # 0.076,
                                             "classify": True,
-                                            "threshold": -1.1}},
+                                            "threshold": -1.1,
+                                            "saturation_limit": 70000.0}},
                             "wfc3": {"ir": {"fwhmpsf": 0.25,  # 0.14
                                             "classify": False,
-                                            "threshold": None},
+                                            "threshold": None,
+                                            "saturation_limit": 100000.0},
                                      "uvis": {"fwhmpsf": 0.152,  # 0.076
                                               "classify": True,
-                                              "threshold": None}}}
+                                              "threshold": None,
+                                              "saturation_limit": 70000.0}}}
 
 log = logutil.create_logger('alignimages', level=logutil.logging.INFO, stream=sys.stdout)
 
@@ -1090,6 +1095,10 @@ def generate_source_catalogs(imglist, **pars):
             sys.error("ERROR! Unrecognized instrument '{}'. Exiting...".format(instrument))
             log.exit("ERROR! Unrecognized instrument '{}'. Exiting...".format(instrument))
 
+        # Convert saturation_limit into absolute number
+        slimit = detector_pars['saturation_limit']
+        if slimit < 0:
+            detector_pars['saturation_limit'] *= -1 * imgprimaryheader['exptime']
         # Identify sources in image, convert coords from chip x, y form to reference WCS sky RA, Dec form.
         imgwcs = HSTWCS(imghdu, 1)
         # Convert fwhmpsf from arsec to pixels

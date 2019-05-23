@@ -35,7 +35,7 @@ from astropy.coordinates import SkyCoord
 from astropy.io import fits as fits
 from astropy.io import ascii
 from astropy.convolution import Gaussian2DKernel
-from astropy.stats import gaussian_fwhm_to_sigma
+from astropy.stats import gaussian_fwhm_to_sigma, gaussian_sigma_to_fwhm
 from astropy.nddata.bitmask import bitfield_to_boolean_mask
 from astropy.visualization import SqrtStretch
 from astropy.visualization.mpl_normalize import ImageNormalize
@@ -294,7 +294,8 @@ def find_gsc_offset(image, input_catalog='GSC1', output_catalog='GAIA'):
 
 def extract_sources(img, dqmask=None, fwhm=3.0, threshold=None, source_box=7,
                     classify=True, centering_mode="starfind", nlargest=None,
-                    outroot=None, plot=False, vmax=None, deblend=False):
+                    outroot=None, plot=False, vmax=None, deblend=False,
+                    isolation_size=101, saturation_limit=None):
     """Use photutils to find sources in image based on segmentation.
 
     Parameters
@@ -348,6 +349,8 @@ def extract_sources(img, dqmask=None, fwhm=3.0, threshold=None, source_box=7,
     bkg_estimator = MedianBackground()
     bkg = None
 
+    sigma = fwhm * gaussian_fwhm_to_sigma
+
     exclude_percentiles = [10, 25, 50, 75]
     for percentile in exclude_percentiles:
         try:
@@ -370,7 +373,7 @@ def extract_sources(img, dqmask=None, fwhm=3.0, threshold=None, source_box=7,
                 log.info("{} based on {}".format(threshold.max(), default_threshold.max()))
                 bkg_rms_mean = threshold.max()
             else:
-                bkg_rms_mean = 3. * threshold
+                bkg_rms_mean = threshold  # 3. * threshold
 
             if bkg_rms_mean < 0:
                 bkg_rms_mean = 0.
@@ -382,9 +385,36 @@ def extract_sources(img, dqmask=None, fwhm=3.0, threshold=None, source_box=7,
         bkg_rms_mean = max(0.01, imgarr.min())
         bkg_rms = bkg_rms_mean * 5
 
-    sigma = fwhm * gaussian_fwhm_to_sigma
-    kernel = Gaussian2DKernel(sigma, x_size=source_box, y_size=source_box)
-    kernel.normalize()
+    # Try to use PSF derived from image as detection kernel
+    # Kernel must be derived from well-isolated sources not near the edge of the image
+    kern_img = imgarr.copy()
+    edge = source_box * 2
+    kern_img[:edge, :] = 0.0
+    kern_img[-edge:, :] = 0.0
+    kern_img[:, :edge] = 0.0
+    kern_img[:, -edge:] = 0.0
+    peaks = photutils.detection.find_peaks(kern_img, threshold=threshold, box_size=isolation_size)
+    if len(peaks['peak_value'][peaks['peak_value'] > saturation_limit]):
+        # Make sure only peaks less than saturation limit are evaluated
+        peaks['peak_value'][peaks['peak_value'] >= saturation_limit] = 0.
+    # Sort based on peak_value to identify brightest sources for use as a kernel
+    peaks.sort('peak_value')
+
+    # Identify position of brightest, non-saturated peak (in numpy index order)
+    kernel_pos = [peaks['y_peak'][-1], peaks['x_peak'][-1]]
+    kernel = imgarr[kernel_pos[0] - source_box:kernel_pos[0] + source_box + 1,
+                    kernel_pos[1] - source_box:kernel_pos[1] + source_box + 1]
+    log.info("kernel[{},{}]".format(kernel_pos[1], kernel_pos[0]))
+    peaks['x_peak'] += 1
+    peaks['y_peak'] += 1
+
+    # Normalize the new kernel to a total flux of 1.0
+    if kernel.sum() > 0.0:
+        kernel /= kernel.sum()
+    else:
+        # Generate a default kernel using a simple 2D Gaussian
+        kernel = Gaussian2DKernel(sigma, x_size=source_box, y_size=source_box)
+        kernel.normalize()
     segm = detect_sources(imgarr, threshold, npixels=source_box,
                           filter_kernel=kernel)
     # photutils >= 0.7: segm=None; photutils < 0.7: segm.nlabels=0
@@ -396,9 +426,12 @@ def extract_sources(img, dqmask=None, fwhm=3.0, threshold=None, source_box=7,
         segm = deblend_sources(imgarr, segm, npixels=5,
                                filter_kernel=kernel, nlevels=16,
                                contrast=0.01)
+
+    # Generate the source properties for all the segments for use in centering
+    cat = source_properties(imgarr, segm)
+
     # If classify is turned on, it should modify the segmentation map
     if classify:
-        cat = source_properties(imgarr, segm)
         # Remove likely cosmic-rays based on central_moments classification
         bad_srcs = np.where(classify_sources(cat) == 0)[0] + 1
 
@@ -413,13 +446,22 @@ def extract_sources(img, dqmask=None, fwhm=3.0, threshold=None, source_box=7,
                 idx[segm.labels] = segm.labels
                 idx[bad_srcs] = 0
                 segm.data = idx[segm.data]
+    # Extract the average sigma for detected sources
+    source_table = cat.to_table()
+    smajor_sigma = source_table['semimajor_axis_sigma'].mean().value
+    sminor_sigma = source_table['semiminor_axis_sigma'].mean().value
+    sigma_ratio = sminor_sigma / smajor_sigma
+    source_fwhm = smajor_sigma * gaussian_sigma_to_fwhm
 
     # convert segm to mask for daofind
     if centering_mode == 'starfind':
         src_table = None
         # daofind = IRAFStarFinder(fwhm=fwhm, threshold=5.*bkg.background_rms_median)
-        log.info("Setting up DAOStarFinder with: \n    fwhm={}  threshold={}".format(fwhm, bkg_rms_mean))
-        daofind = DAOStarFinder(fwhm=fwhm, threshold=bkg_rms_mean)
+        info_str = "Setting up DAOStarFinder with: \n    fwhm={}".format(source_fwhm)
+        info_str += "    threshold={}".format(bkg_rms_mean)
+        info_str += "    ratio={}".format(sigma_ratio)
+        log.info(info_str)
+        daofind = DAOStarFinder(fwhm=source_fwhm, threshold=bkg_rms_mean)
 
         # Identify nbrightest/largest sources
         if nlargest is not None:
@@ -461,13 +503,25 @@ def extract_sources(img, dqmask=None, fwhm=3.0, threshold=None, source_box=7,
                 src_table = Table(names=seg_table.colnames,
                                   dtype=[dt[1] for dt in seg_table.dtype.descr])
 
-            if seg_table and seg_table['peak'].max() == detection_img.max():
+            box_lower = int(np.floor(source_box / 2))
+            box_upper = int(np.ceil(source_box / 2))
+            if seg_table:
                 max_row = np.where(seg_table['peak'] == seg_table['peak'].max())[0][0]
-                # Add row for detected source to master catalog
-                # apply offset to slice to convert positions into full-frame coordinates
-                seg_table['xcentroid'] += seg_xoffset
-                seg_table['ycentroid'] += seg_yoffset
-                src_table.add_row(seg_table[max_row])
+                peak_pix = (int(seg_table['xcentroid'][max_row] + 0.5),
+                            int(seg_table['ycentroid'][max_row] + 0.5))
+                peak_xmin = max(0, peak_pix[0] - box_lower)
+                peak_xmax = min(peak_pix[0] + box_upper, segment.data.shape[1])
+                peak_ymin = max(0, peak_pix[1] - box_lower)
+                peak_ymax = min(peak_pix[0] + box_upper, segment.data.shape[0])
+
+                peak_slice = detection_img[peak_ymin:peak_ymax, peak_xmin:peak_xmax]
+                if peak_slice.max() == detection_img.max():
+                # if seg_table and seg_table['peak'].max() == detection_img.max():
+                    # Add row for detected source to master catalog
+                    # apply offset to slice to convert positions into full-frame coordinates
+                    seg_table['xcentroid'] += seg_xoffset
+                    seg_table['ycentroid'] += seg_yoffset
+                    src_table.add_row(seg_table[max_row])
 
     else:
         cat = source_properties(img, segm)
@@ -631,7 +685,6 @@ def generate_source_catalog(image, dqname="DQ", output=False, fwhm=3.0, **detect
             # dqmask = bitfield_to_boolean_mask(dqarr, good_mask_value=False)
             # TODO: <---Remove this old no-sat bit grow line once this
             # thing works
-
         seg_tab, segmap = extract_sources(imgarr, dqmask=dqmask, outroot=outroot, fwhm=fwhm, **detector_pars)
         seg_tab_phot = seg_tab
 

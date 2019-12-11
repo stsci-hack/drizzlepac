@@ -105,6 +105,35 @@ class BasePipeline:
                     download_crds(refname, self.timeout)
         return filename
 
+    def test_astrometric_asn(self, dataset_names):
+        """ Tests pipeline-style processing of a singleton exposure using runastrodriz.
+        """
+        # Get sample data through astroquery
+        asnfile = aqutils.retrieve_observation(dataset_names, suffix=['ASN'])[0]
+        flcfiles = aqutils.retrieve_observation(dataset_names, suffix=['FLC', 'FLT', 'RAW'])
+        fltfile = None
+        for f in flcfiles:
+            if f.endswith('_flt.fits'):
+                fltfile = f
+                break
+        # Retrieve reference files for these as well
+        self.get_input_file('', flcfiles[0], docopy=False)
+
+        # Insure environment variables are set for full processing
+        os.environ['ASTROMETRY_STEP_CONTROL'] = 'on'
+        os.environ['ASTROMETRY_COMPUTE_APOSTERIORI'] = 'on'
+        os.environ['ASTROMETRY_APPLY_APRIORI'] = 'on'
+
+        # Run pipeline processing using
+        runastrodriz.process(asnfile, force=True, inmemory=True)
+
+        # compare WCSNAMEs from flt and flc files
+        flc_wcsname = fits.getval(fltfile, 'wcsname', ext=1)
+
+        # Perform comparisons:
+        #   - WCSNAME values should contain '-' from either a priori or a posteriori solution
+        assert('-' in flc_wcsname)
+
 
 class BaseWFC3Pipeline(BasePipeline):
     refstr = 'iref'
@@ -115,6 +144,14 @@ class BaseWFC3Pipeline(BasePipeline):
                        'upwtim', 'wcscdate', 'upwcsver', 'pywcsver',
                        'history', 'prod_ver', 'rulefile']
 
+class BaseACSPipeline(BasePipeline):
+    refstr = 'jref'
+    input_loc = ''
+    ref_loc = 'acs/ref'
+    prevref = os.environ.get(refstr)
+    ignore_keywords = ['origin', 'filename', 'date', 'iraf-tlm', 'fitsdate',
+                       'upwtim', 'wcscdate', 'upwcsver', 'pywcsver',
+                       'history', 'prod_ver', 'rulefile']
 
 
 class TestSingleton(BaseWFC3Pipeline):
@@ -152,3 +189,27 @@ class TestSingleton(BaseWFC3Pipeline):
         assert('-' in flc_wcsname)
         assert('-' in flt_wcsname)
         assert(flc_wcsname == flt_wcsname)
+
+
+class TestWFC3ASN(BaseWFC3Pipeline):
+    """
+    Datasets included are:
+      - id7319030 : Nebula with stars, variable background + saturated sources => GAIADR2
+      - ib5w02030 : small overlap, large dither => GAIADR1
+      - ib3m53020 : 47Tuc with 0.5s, 30s, and 300s exposures with many sat. sources => GAIADR2
+      - idi160010 : No apriori WCS in database, empty SCI => GSC240
+    """
+    @pytest.mark.parametrize(
+        'dataset_names', ['id7319030', 'ib5w02030', 'ib3m53020', 'idi160010']
+    )
+
+
+class TestACSASN(BaseACSPipeline):
+    """
+    Datasets included are:
+      - j8bt04010 : 47Tuc => GAIADR2
+      - jdho15010 : 43s, 2 x 1270s exposures of NGC-6752(glob cluster) => GAIADR1
+    """
+    @pytest.mark.parametrize(
+        'dataset_names', ['j8bt04010', 'jdho15010']
+    )

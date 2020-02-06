@@ -475,6 +475,9 @@ def update_wcs(image, extnum, new_wcs, wcsname="", reusename=False, verbose=Fals
             new_wcs.printwcs()
             print("WCSNAME  : ", wcsname)
 
+        # Insure that the new WCS keywords are for a PRIMARY WCS, regardless of what
+        # WCS was originally provided (alternate or PRIMARY)
+        new_wcs.wcs.alt = " "
         # Insure that if a copy of the WCS has not been created yet, it will be now
         wcs_hdr = new_wcs.wcs2header(idc2hdr=idchdr, relax=True)
 
